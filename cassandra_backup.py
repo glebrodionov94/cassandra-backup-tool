@@ -5,17 +5,20 @@ import argparse
 import logging
 import gzip
 import ssl
+import base64
 from math import ceil
-from typing import Optional
+from typing import Optional, Iterable, Tuple, List, Any
+from decimal import Decimal
+from uuid import UUID
+from datetime import datetime
 
-from cassandra.cluster import Cluster, ConsistencyLevel
+from cassandra.cluster import Cluster, ConsistencyLevel, ResultSet
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.query import SimpleStatement, BatchStatement
+from cassandra.metadata import ColumnMetadata
 from tqdm import tqdm
 
-
 logger = logging.getLogger("cassandra_backup")
-
 
 # Карта строковых значений в уровни консистентности Cassandra
 CONSISTENCY_MAP = {
@@ -32,15 +35,57 @@ CONSISTENCY_MAP = {
     "LOCAL_ONE": ConsistencyLevel.LOCAL_ONE,
 }
 
+# ---------- JSON (де)сериализация специальных типов ----------
+
+def _json_default(o: Any):
+    if isinstance(o, datetime):
+        return o.isoformat(timespec="microseconds")
+    if isinstance(o, Decimal):
+        return str(o)
+    if isinstance(o, UUID):
+        return str(o)
+    if isinstance(o, (set, frozenset)):
+        return list(o)
+    if isinstance(o, (bytes, bytearray, memoryview)):
+        return {"__blob__": True, "b64": base64.b64encode(bytes(o)).decode("ascii")}
+    return o  # пусть попробует сериализовать как есть или упадет явно
+
+def _coerce_value(col_meta: ColumnMetadata, v: Any):
+    """
+    Минимальный коэрсер типов JSON->Cassandra на основе метаданных колонки.
+    Этого достаточно для uuid/decimal/timestamp/blob/set. Остальные остаются как есть.
+    """
+    if v is None:
+        return None
+
+    # blob-обёртка от нашего энкодера
+    if isinstance(v, dict) and v.get("__blob__") and "b64" in v:
+        return base64.b64decode(v["b64"])
+
+    t = col_meta.cql_type
+    name = getattr(t, 'typename', str(t)).lower()
+
+    try:
+        if name in ('uuid', 'timeuuid') and isinstance(v, str):
+            return UUID(v)
+        if name == 'decimal' and isinstance(v, str):
+            return Decimal(v)
+        if name in ('timestamp', 'date') and isinstance(v, str):
+            return datetime.fromisoformat(v)
+        if name.startswith('set<') and isinstance(v, list):
+            return set(v)
+        # list/map — как есть (JSON совместимы)
+    except Exception as e:
+        logger.warning(f"Не удалось привести значение для колонки {col_meta.name} типа {name}: {e}")
+    return v
+
+# ---------- Класс бэкапа ----------
 
 class CassandraBackup:
     def __init__(self, contact_points, username: Optional[str] = None, password: Optional[str] = None,
                  port: int = 9042, ssl_context: Optional[ssl.SSLContext] = None,
                  idempotent: bool = False, timeout: Optional[float] = None,
                  read_consistency: str = "LOCAL_ONE", write_consistency: str = "QUORUM"):
-        """
-        Инициализация подключения к Cassandra (TLS/SSL, идемпотентность, таймаут, консистентность).
-        """
         auth_provider = None
         if username and password:
             auth_provider = PlainTextAuthProvider(username=username, password=password)
@@ -58,36 +103,101 @@ class CassandraBackup:
         self.read_consistency = CONSISTENCY_MAP.get(read_consistency.upper(), ConsistencyLevel.LOCAL_ONE)
         self.write_consistency = CONSISTENCY_MAP.get(write_consistency.upper(), ConsistencyLevel.QUORUM)
 
+        self._pbar_lock = None  # инициализируем после старта backup/restore
+
     async def connect(self):
-        """Асинхронное подключение (через executor, т.к. драйвер sync)."""
-        loop = asyncio.get_event_loop()
+        """Асинхронное подключение (через executor, т.к. драйвер sync на соединении)."""
+        loop = asyncio.get_running_loop()
         self.session = await loop.run_in_executor(None, self.cluster.connect)
         logger.info("Подключение к кластеру Cassandra установлено")
 
     async def close(self):
-        """Корректное закрытие кластера."""
-        if self.cluster:
-            self.cluster.shutdown()
-            logger.info("Соединение с кластером Cassandra закрыто")
+        """Корректное закрытие."""
+        def _shutdown():
+            try:
+                if self.session:
+                    self.session.shutdown()
+            finally:
+                self.cluster.shutdown()
 
-    def _get_pk(self, keyspace: str, table_name: str):
-        """Возвращает список колонок первичного ключа (partition+clustering) для token(...)."""
-        table_meta = self.cluster.metadata.keyspaces[keyspace].tables[table_name]
-        return [col.name for col in table_meta.primary_key]
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _shutdown)
+        logger.info("Соединение с кластером Cassandra закрыто")
 
-    def _exec(self, statement, write: bool = False):
-        """Выполнение запроса с нужным consistency level и общим timeout."""
+    # ---------- Низкоуровневые async-обёртки над execute_async ----------
+
+    async def _await_rf(self, response_future):
+        """
+        Делаем ResponseFuture драйвера awaitable для asyncio.
+        """
+        loop = asyncio.get_running_loop()
+        afut = loop.create_future()
+
+        def _on_success(result):
+            loop.call_soon_threadsafe(afut.set_result, result)
+
+        def _on_error(exc):
+            loop.call_soon_threadsafe(afut.set_exception, exc)
+
+        response_future.add_callbacks(_on_success, _on_error)
+        return await afut
+
+    def _exec_async(self, statement, write: bool = False):
+        """Устанавливаем consistency и отправляем запрос асинхронно."""
         if isinstance(statement, (SimpleStatement, BatchStatement)):
             statement.consistency_level = self.write_consistency if write else self.read_consistency
-        return self.session.execute(statement, timeout=self.timeout)
+            statement.is_idempotent = self.idempotent
+        return self.session.execute_async(statement, timeout=self.timeout)
+
+    async def _iter_rows(self, stmt: SimpleStatement) -> Iterable:
+        """
+        Асинхронный итератор по всем страницам ResultSet (respect fetch_size).
+        """
+        rf = self._exec_async(stmt, write=False)
+        rs: ResultSet = await self._await_rf(rf)
+        # первая страница
+        for row in rs.current_rows:
+            yield row
+
+        # последующие страницы
+        while rs.has_more_pages:
+            rf2 = rs.fetch_next_page()
+            rs = await self._await_rf(rf2)
+            for row in rs.current_rows:
+                yield row
+
+    # ---------- Метаданные ----------
+
+    def _get_partition_key(self, keyspace: str, table_name: str) -> List[str]:
+        """Возвращает список колонок partition key — только они допустимы в token(...)."""
+        table_meta = self.cluster.metadata.keyspaces[keyspace].tables[table_name]
+        return [col.name for col in table_meta.partition_key]
+
+    def _wait_schema_agreement(self, timeout=240, poll=2) -> bool:
+        """Синхронное ожидание согласования схемы — быстрое; можно оставить sync."""
+        import time
+        start = time.time()
+        while time.time() - start < timeout:
+            if self.cluster.metadata.check_schema_agreement():
+                return True
+            time.sleep(poll)
+        logger.warning("Schema agreement not reached within timeout")
+        return False
+
+    # ---------- Бэкап ----------
 
     async def _backup_shard(self, keyspace: str, table_name: str, output_dir: str, fetch_size: int,
                             gzip_enabled: bool, chunk_size: Optional[int], shard_id: int,
                             start_token: int, end_token: int, sem: asyncio.Semaphore,
                             pbar: tqdm, shard_row_limit: Optional[int]):
-        """Выгрузка одного шарда таблицы по token диапазону с опциональным лимитом строк на шард."""
+        """Выгрузка одного шарда таблицы по token диапазону (partition key only)."""
         async with sem:
-            pk = ",".join(self._get_pk(keyspace, table_name))
+            pk_cols = self._get_partition_key(keyspace, table_name)
+            if not pk_cols:
+                logger.warning(f"Таблица {table_name}: отсутствует partition key? Пропускаю.")
+                return
+            pk = ",".join(pk_cols)
+
             limit_clause = f" LIMIT {shard_row_limit}" if shard_row_limit else ""
             query = (
                 f"SELECT * FROM {keyspace}.{table_name} "
@@ -95,9 +205,8 @@ class CassandraBackup:
                 f"{limit_clause}"
             )
             stmt = SimpleStatement(query, fetch_size=fetch_size)
-            stmt.is_idempotent = self.idempotent  # SELECT безопасно помечать идемпотентным
+            stmt.is_idempotent = self.idempotent
             stmt.consistency_level = self.read_consistency
-            rows = self._exec(stmt, write=False)
 
             part = 1
             local_count = 0
@@ -114,24 +223,29 @@ class CassandraBackup:
             f, filename = new_file()
             first = True
 
-            for row in rows:
+            async for row in self._iter_rows(stmt):
                 if shard_row_limit and local_count >= shard_row_limit:
                     break
 
                 row_dict = dict(row._asdict())
-                # Нормализуем коллекции к JSON-совместимым типам
-                for k, v in row_dict.items():
-                    if hasattr(v, "__iter__") and not isinstance(v, (str, bytes, dict)):
+                # конвертер коллекций в JSON‑дружественное
+                for k, v in list(row_dict.items()):
+                    if isinstance(v, (set, frozenset)):
                         row_dict[k] = list(v)
 
                 if not first:
                     f.write(",\n")
-                f.write(json.dumps(row_dict, ensure_ascii=False))
+                f.write(json.dumps(row_dict, ensure_ascii=False, default=_json_default))
                 first = False
 
                 local_count += 1
                 chunk_count += 1
-                pbar.update(1)
+                # обновление прогресса потокобезопасно
+                if self._pbar_lock:
+                    async with self._pbar_lock:
+                        pbar.update(1)
+                else:
+                    pbar.update(1)
 
                 if chunk_size and chunk_count >= chunk_size:
                     f.write("\n]\n")
@@ -144,6 +258,7 @@ class CassandraBackup:
                     f, filename = new_file()
                     first = True
 
+            # закрыть хвост
             f.write("\n]\n")
             f.close()
             logger.info(
@@ -182,7 +297,8 @@ class CassandraBackup:
                               tables=None, fetch_size: int = 5000,
                               gzip_enabled: bool = False, chunk_size: Optional[int] = None,
                               parallel: int = 2, shards: Optional[int] = None,
-                              limit_per_table: Optional[int] = None):
+                              limit_per_table: Optional[int] = None,
+                              estimate_progress: bool = False):
         """Бэкап keyspace (таблицы выборочно/все), шардирование и лимит строк."""
         os.makedirs(output_dir, exist_ok=True)
         keyspace_meta = self.cluster.metadata.keyspaces[keyspace]
@@ -191,6 +307,9 @@ class CassandraBackup:
         if tables:
             selected = set(tables)
             table_names = [t for t in keyspace_meta.tables.keys() if t in selected]
+            missing = selected - set(table_names)
+            if missing:
+                logger.warning(f"Некоторые таблицы не найдены и будут пропущены: {', '.join(sorted(missing))}")
             logger.info(f"Бэкап только таблиц: {', '.join(table_names)}")
         else:
             table_names = list(keyspace_meta.tables.keys())
@@ -202,21 +321,6 @@ class CassandraBackup:
             logger.info(f"Автоматически выбрано количество шардов: {shards} (узлов: {num_nodes})")
         else:
             logger.info(f"Используем заданное количество шардов: {shards}")
-
-        # Оценка общего числа строк для прогресса
-        total_rows = 0
-        for table_name in table_names:
-            try:
-                stmt = SimpleStatement(f"SELECT count(*) FROM {keyspace}.{table_name}")
-                stmt.is_idempotent = self.idempotent
-                stmt.consistency_level = self.read_consistency
-                row = self._exec(stmt, write=False).one()
-                cnt = row[0] if row else 0
-                if limit_per_table is not None:
-                    cnt = min(cnt, limit_per_table)
-                total_rows += cnt
-            except Exception as e:
-                logger.warning(f"Не удалось посчитать строки в {table_name}: {e}")
 
         # Сохраняем схему (keyspace, UDT, tables, indexes, materialized views)
         schema_file = os.path.join(output_dir, f"{keyspace}_schema.cql")
@@ -232,9 +336,18 @@ class CassandraBackup:
                 f.write(f"{mv.as_cql_query()};\n\n")
         logger.info(f"Схема keyspace '{keyspace}' сохранена в {schema_file}")
 
-        # Параллельная выгрузка таблиц
+        # Прогресс: без COUNT(*) (дорого). По желанию можно включить грубую оценку.
+        total_rows = None
+        if estimate_progress:
+            logger.info("Включена грубая оценка прогресса (total). Внимание: может быть неточно.")
+            # На ваше усмотрение можно прикинуть total по лимитам.
+            if limit_per_table:
+                total_rows = limit_per_table * len(table_names)
+
+        self._pbar_lock = asyncio.Lock()
         sem = asyncio.Semaphore(parallel)
-        with tqdm(total=total_rows, desc="Общий прогресс бэкапа", unit="строк") as pbar:
+        desc = "Общий прогресс бэкапа"
+        with tqdm(total=total_rows, desc=desc, unit="строк") as pbar:
             tasks = [
                 self._backup_table(keyspace, tname, output_dir,
                                    fetch_size, gzip_enabled, chunk_size,
@@ -244,14 +357,18 @@ class CassandraBackup:
             ]
             await asyncio.gather(*tasks)
 
-        logger.info(f"✅ Бэкап keyspace '{keyspace}' завершён (оценочно строк: {total_rows})")
+        logger.info(f"✅ Бэкап keyspace '{keyspace}' завершён")
+
+    # ---------- Восстановление ----------
 
     async def _restore_table(self, keyspace: str, table_file: str, batch_size: Optional[int],
                              sem: asyncio.Semaphore, pbar: tqdm,
                              retries: int = 5, delay: int = 2):
-        """Восстановление одной таблицы из файла (json/json.gz) с batch-вставками и retry."""
+        """Восстановление одной таблицы из файла (json/json.gz) с batch-вставками и retry (async)."""
         async with sem:
-            table_name = os.path.basename(table_file).split("_part")[0]
+            base = os.path.basename(table_file)
+            # ожидаем формат <table>_shardX_partY.json(.gz) или <table>_partY.json(.gz)
+            table_name = base.split("_part")[0]
             open_func = gzip.open if table_file.endswith(".gz") else open
 
             with open_func(table_file, "rt", encoding="utf-8") as f:
@@ -280,6 +397,11 @@ class CassandraBackup:
             columns = list(data[0].keys())
             col_str = ", ".join(columns)
             placeholders = ", ".join(["%s"] * len(columns))
+
+            # Метаданные для коэрсинга значений
+            table_meta = self.cluster.metadata.keyspaces[keyspace].tables[table_name]
+            col_metas = [table_meta.columns[c] for c in columns]
+
             prepared = self.session.prepare(
                 f"INSERT INTO {keyspace}.{table_name} ({col_str}) VALUES ({placeholders})"
             )
@@ -288,14 +410,17 @@ class CassandraBackup:
                 batch = BatchStatement()
                 batch.is_idempotent = self.idempotent
                 batch.consistency_level = self.write_consistency
-                for row in data[i:i + bsize]:
-                    batch.add(prepared, tuple(row.values()))
+
+                slice_rows = data[i:i + bsize]
+                for row in slice_rows:
+                    vals = tuple(_coerce_value(cm, row.get(c)) for c, cm in zip(columns, col_metas))
+                    batch.add(prepared, vals)
 
                 attempt = 0
                 while attempt < retries:
                     try:
-                        # Пишем с write=True для корректного consistency/timeout
-                        self._exec(batch, write=True)
+                        rf = self._exec_async(batch, write=True)
+                        await self._await_rf(rf)
                         break
                     except Exception as e:
                         attempt += 1
@@ -308,7 +433,11 @@ class CassandraBackup:
                 else:
                     logger.error(f"❌ Достигнут лимит retry при вставке в {table_name}, блок {i//bsize}")
 
-                pbar.update(len(data[i:i + bsize]))
+                if self._pbar_lock:
+                    async with self._pbar_lock:
+                        pbar.update(len(slice_rows))
+                else:
+                    pbar.update(len(slice_rows))
 
             logger.info(f"Таблица '{table_name}' восстановлена из {table_file} ({len(data)} строк)")
 
@@ -319,28 +448,41 @@ class CassandraBackup:
         """
         Восстановление keyspace: схема + данные из json/json.gz (части учитываются и сортируются).
         """
+        # DROP (опционально) — DDL + schema agreement
         if drop:
             logger.warning(f"Удаляю keyspace '{keyspace}' перед восстановлением")
             stmt = SimpleStatement(f"DROP KEYSPACE IF EXISTS {keyspace}")
             stmt.is_idempotent = self.idempotent
             stmt.consistency_level = self.write_consistency
-            self._exec(stmt, write=True)
+            rf = self._exec_async(stmt, write=True)
+            try:
+                await self._await_rf(rf)
+            finally:
+                self._wait_schema_agreement()
 
         # Восстанавливаем схему
         schema_file = os.path.join(input_dir, f"{keyspace}_schema.cql")
         with open(schema_file, "r", encoding="utf-8") as f:
             schema_cql = f.read()
 
+        # Простая сегментация по ';'
         for raw_stmt in schema_cql.split(";"):
             stmt_str = raw_stmt.strip()
-            if stmt_str:
-                try:
-                    stmt = SimpleStatement(stmt_str)
-                    stmt.is_idempotent = self.idempotent
-                    stmt.consistency_level = self.write_consistency
-                    self._exec(stmt, write=True)
-                except Exception as e:
-                    logger.error(f"Ошибка при выполнении CQL: {stmt_str[:80]}... | {e}")
+            if not stmt_str:
+                continue
+            # пропустим строки, начинающиеся с WARNING/комментариев, если вдруг попали в файл
+            if stmt_str.upper().startswith("WARNING") or stmt_str.startswith("--"):
+                continue
+            try:
+                stmt = SimpleStatement(stmt_str)
+                stmt.is_idempotent = self.idempotent
+                stmt.consistency_level = self.write_consistency
+                rf = self._exec_async(stmt, write=True)
+                await self._await_rf(rf)
+                # после каждого DDL — дождаться agreement
+                self._wait_schema_agreement()
+            except Exception as e:
+                logger.error(f"Ошибка при выполнении CQL: {stmt_str[:160]}... | {e}")
 
         logger.info(f"Схема keyspace '{keyspace}' восстановлена")
 
@@ -352,7 +494,7 @@ class CassandraBackup:
         if tables:
             selected = set(tables)
             files = [f for f in all_files if os.path.basename(f).split("_part")[0] in selected]
-            logger.info(f"Восстанавливаем только таблицы: {', '.join(selected)}")
+            logger.info(f"Восстанавливаем только таблицы: {', '.join(sorted(selected))}")
         else:
             files = all_files
 
@@ -371,19 +513,10 @@ class CassandraBackup:
 
         files.sort(key=sort_key)
 
-        # Считаем общий объём строк (для прогресса)
-        total_rows = 0
-        for fpath in files:
-            try:
-                open_func = gzip.open if fpath.endswith(".gz") else open
-                with open_func(fpath, "rt", encoding="utf-8") as fh:
-                    total_rows += len(json.load(fh))
-            except Exception:
-                pass
-
-        # Параллельная загрузка таблиц
+        # Прогресс без total (чтобы не грузить COUNT(*))
+        self._pbar_lock = asyncio.Lock()
         sem = asyncio.Semaphore(parallel)
-        with tqdm(total=total_rows, desc="Общий прогресс восстановления", unit="строк") as pbar:
+        with tqdm(total=None, desc="Общий прогресс восстановления", unit="строк") as pbar:
             tasks = [
                 self._restore_table(keyspace, fpath, batch_size, sem, pbar,
                                     retries=retries, delay=retry_delay)
@@ -391,8 +524,9 @@ class CassandraBackup:
             ]
             await asyncio.gather(*tasks)
 
-        logger.info(f"✅ Восстановление keyspace '{keyspace}' завершено (строк: {total_rows})")
+        logger.info(f"✅ Восстановление keyspace '{keyspace}' завершено")
 
+# ---------- TLS ----------
 
 def build_ssl_context(enable_ssl: bool, ca_cert: Optional[str], client_cert: Optional[str],
                       client_key: Optional[str], no_verify: bool) -> Optional[ssl.SSLContext]:
@@ -416,9 +550,10 @@ def build_ssl_context(enable_ssl: bool, ca_cert: Optional[str], client_cert: Opt
 
     return ctx
 
+# ---------- CLI ----------
 
 async def main():
-    parser = argparse.ArgumentParser(description="Cassandra backup/restore tool")
+    parser = argparse.ArgumentParser(description="Cassandra backup/restore tool (async)")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # -------- backup CLI --------
@@ -432,6 +567,8 @@ async def main():
     backup_parser.add_argument("--parallel", type=int, default=2, help="Макс. параллельных таблиц при бэкапе (default=2)")
     backup_parser.add_argument("--shards", type=int, help="Параллельных шардов на таблицу (по умолчанию = 2 × число узлов)")
     backup_parser.add_argument("--limit", type=int, help="Макс. строк на таблицу (распределяется по шардам)")
+    backup_parser.add_argument("--estimate-progress", action="store_true",
+                               help="Грубая оценка total для прогресса (иначе без total)")
 
     # -------- restore CLI --------
     restore_parser = subparsers.add_parser("restore", help="Restore a keyspace")
@@ -455,7 +592,7 @@ async def main():
     parser.add_argument("--client-key", help="Путь к приватному ключу (PEM) для mTLS")
     parser.add_argument("--ssl-no-verify", action="store_true", help="Отключить проверку сертификата/имени хоста (НЕ рек.)")
     parser.add_argument("--idempotent", action="store_true", help="Пометить запросы как идемпотентные")
-    parser.add_argument("--timeout", type=float, help="Таймаут запросов (сек.) для execute()")
+    parser.add_argument("--timeout", type=float, help="Таймаут запросов (сек.) для execute_async()")
 
     # раздельная консистентность
     parser.add_argument("--read-consistency", default="LOCAL_ONE", help="Уровень консистентности для SELECT (default=LOCAL_ONE)")
@@ -499,7 +636,7 @@ async def main():
     await backup.connect()
 
     if args.command == "backup":
-        tables = args.tables.split(",") if args.tables else None
+        tables = [t.strip() for t in args.tables.split(",")] if args.tables else None
         await backup.backup_keyspace(args.keyspace, args.output_dir,
                                      tables=tables,
                                      fetch_size=args.fetch_size,
@@ -507,9 +644,10 @@ async def main():
                                      chunk_size=args.chunk_size,
                                      parallel=args.parallel,
                                      shards=args.shards,
-                                     limit_per_table=args.limit)
+                                     limit_per_table=args.limit,
+                                     estimate_progress=args.estimate_progress)
     elif args.command == "restore":
-        tables = args.tables.split(",") if args.tables else None
+        tables = [t.strip() for t in args.tables.split(",")] if args.tables else None
         await backup.restore_keyspace(args.keyspace, args.input_dir,
                                       drop=args.drop,
                                       batch_size=args.batch_size,
@@ -519,7 +657,6 @@ async def main():
                                       retry_delay=args.retry_delay)
 
     await backup.close()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
