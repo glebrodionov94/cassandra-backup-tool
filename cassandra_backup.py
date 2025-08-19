@@ -14,11 +14,18 @@ from decimal import Decimal
 from uuid import UUID
 from datetime import datetime
 
-from cassandra.cluster import Cluster, ConsistencyLevel, ResultSet, SocketOptions
+from cassandra.cluster import Cluster, ConsistencyLevel, ResultSet
+try:
+    # В некоторых сборках драйвера класс может отсутствовать
+    from cassandra.cluster import SocketOptions  # type: ignore
+except Exception:
+    SocketOptions = None  # type: ignore
+
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.query import SimpleStatement, BatchStatement
 from cassandra.metadata import ColumnMetadata
 from cassandra.policies import DCAwareRoundRobinPolicy, ExponentialReconnectionPolicy
+from cassandra.query import dict_factory
 from tqdm import tqdm
 
 logger = logging.getLogger("cassandra_backup")
@@ -45,7 +52,46 @@ _NAME_RE = re.compile(
 )
 
 
-# -------------------- JSON (де)сериализация специальных типов --------------------
+# -------------------- JSON (де)сериализация спец. типов --------------------
+def _to_jsonable(obj: Any, _seen: Optional[set] = None):
+    """
+    Безопасно конвертирует любые вложенные структуры в JSON-совместимые типы.
+    Детектит циклы и не падает на них.
+    """
+    if _seen is None:
+        _seen = set()
+
+    # Примитивы
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    oid = id(obj)
+    if oid in _seen:
+        # Маркер на случай ссылочного цикла
+        return {"__circular__": True, "type": type(obj).__name__}
+    _seen.add(oid)
+
+    # Спецтипы
+    if isinstance(obj, datetime):
+        return obj.isoformat(timespec="microseconds")
+    if isinstance(obj, Decimal):
+        return str(obj)
+    if isinstance(obj, UUID):
+        return str(obj)
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        return {"__blob__": True, "b64": base64.b64encode(bytes(obj)).decode("ascii")}
+
+    # Коллекции/маппинги
+    if isinstance(obj, dict):
+        return {str(_to_jsonable(k, _seen)): _to_jsonable(v, _seen) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [_to_jsonable(v, _seen) for v in obj]
+
+    # Всё остальное — строкой (UDT/кастомные типы драйвера и т.п.)
+    try:
+        return str(obj)
+    except Exception:
+        return {"__unserializable__": True, "type": type(obj).__name__}
 
 def _json_default(o: Any):
     if isinstance(o, datetime):
@@ -59,7 +105,6 @@ def _json_default(o: Any):
     if isinstance(o, (bytes, bytearray, memoryview)):
         return {"__blob__": True, "b64": base64.b64encode(bytes(o)).decode("ascii")}
     return o  # пусть попробует сериализовать как есть
-
 
 def _coerce_value(col_meta: ColumnMetadata, v: Any):
     """
@@ -90,7 +135,6 @@ def _coerce_value(col_meta: ColumnMetadata, v: Any):
         logger.warning(f"Не удалось привести значение для колонки {col_meta.name} типа {name}: {e}")
     return v
 
-
 def _make_idempotent(stmt_str: str) -> str:
     """
     Добавляет IF NOT EXISTS для CREATE объектов, где это безопасно и уместно.
@@ -106,7 +150,6 @@ def _make_idempotent(stmt_str: str) -> str:
     # KEYSPACE обычно уже содержит IF NOT EXISTS в экспортерах драйвера
     return s
 
-
 # -------------------- Класс бэкапа/восстановления --------------------
 
 class CassandraBackup:
@@ -119,17 +162,26 @@ class CassandraBackup:
         if username and password:
             auth_provider = PlainTextAuthProvider(username=username, password=password)
 
-        # Больше устойчивости к сетевым обрывам: TCP keepalive + экспоненциальный реконнект
-        self.cluster = Cluster(
+        # Собираем kwargs для совместимости с разными версиями драйвера
+        cluster_kwargs = dict(
             contact_points=contact_points,
             port=port,
             auth_provider=auth_provider,
             ssl_context=ssl_context,
             load_balancing_policy=DCAwareRoundRobinPolicy(local_dc=local_dc),
             reconnection_policy=ExponentialReconnectionPolicy(1.0, 30.0),
-            socket_options=SocketOptions(connect_timeout=10.0, keepalive=True),
             protocol_version=protocol_version,
         )
+
+        # Добавляем socket_options только если класс доступен в текущей сборке драйвера
+        if SocketOptions is not None:
+            try:
+                cluster_kwargs["socket_options"] = SocketOptions(connect_timeout=10.0, keepalive=True)  # type: ignore
+            except Exception:
+                # На некоторых версиях имя/набор аргументов конструктора может отличаться — просто пропускаем
+                pass
+
+        self.cluster = Cluster(**cluster_kwargs)
         self.session = None
         self.idempotent = bool(idempotent)
         self.timeout = timeout
@@ -162,7 +214,6 @@ class CassandraBackup:
     async def _await_rf(self, response_future):
         """
         Надёжно ждём завершение ResponseFuture без колбэков на event loop.
-        Безопасно обрабатываем None от драйвера.
         """
         if response_future is None:
             return None
@@ -183,8 +234,7 @@ class CassandraBackup:
     async def _iter_rows(self, stmt: SimpleStatement) -> Iterable:
         """
         Асинхронный итератор по всем строкам с поддержкой пагинации.
-        В некоторых версиях драйвера первая страница может прийти list или ResultSet,
-        а fetch_next_page() иногда возвращает None — учитываем оба случая.
+        В разных версиях драйвера первая страница может прийти list или ResultSet.
         """
         rf = self._exec_async(stmt, write=False)
         result = await self._await_rf(rf)
@@ -199,10 +249,11 @@ class CassandraBackup:
             yield row
 
         while state is not None and getattr(state, "has_more_pages", False):
-            next_rf = getattr(state, "fetch_next_page", lambda: None)()
-            next_res = await self._await_rf(next_rf)
-            if next_res is None:
+            fetch_next = getattr(state, "fetch_next_page", None)
+            next_rf = fetch_next() if callable(fetch_next) else None
+            if next_rf is None:
                 break
+            next_res = await self._await_rf(next_rf)
             rows, state = _page_rows_and_state(next_res)
             for row in rows:
                 yield row
@@ -287,16 +338,34 @@ class CassandraBackup:
                 if shard_row_limit and local_count >= shard_row_limit:
                     break
 
+                # Берём dict из Row и прогоняем через безопасный санитайзер
                 row_dict = dict(row._asdict())
-                # Мягкая нормализация коллекций
-                for k, v in list(row_dict.items()):
-                    if isinstance(v, (set, frozenset)):
-                        row_dict[k] = list(v)
+                safe_row = _to_jsonable(row_dict)
 
                 if not first:
                     f.write(",\n")
-                f.write(json.dumps(row_dict, ensure_ascii=False, default=_json_default))
+                f.write(json.dumps(safe_row, ensure_ascii=False))
                 first = False
+
+                local_count += 1
+                chunk_count += 1
+
+                if self._pbar_lock:
+                    async with self._pbar_lock:
+                        pbar.update(1)
+                else:
+                    pbar.update(1)
+
+                if chunk_size and chunk_count >= chunk_size:
+                    f.write("\n]\n")
+                    f.close()
+                    logger.info(
+                        f"Таблица '{table_name}' шард {shard_id} часть {part} сохранена ({chunk_count} строк)"
+                    )
+                    part += 1
+                    chunk_count = 0
+                    f, filename = new_file()
+                    first = True
 
                 local_count += 1
                 chunk_count += 1
@@ -419,18 +488,18 @@ class CassandraBackup:
     # ---------- Восстановление ----------
 
     async def _restore_table(self, keyspace: str, table_file: str, batch_size: Optional[int],
-                            sem: asyncio.Semaphore, pbar: tqdm,
-                            retries: int = 5, delay: int = 2):
+                             sem: asyncio.Semaphore, pbar: tqdm,
+                             retries: int = 5, delay: int = 2):
         async with sem:
             base = os.path.basename(table_file)
             open_func = gzip.open if table_file.endswith(".gz") else open
 
             # 1) Надёжно извлекаем имя таблицы из имени файла
-            m = _NAME_RE.match(base)  # r'^(?P<table>.+?)(?:_shard(?P<shard>\d+))?_part(?P<part>\d+)\.json(?:\.gz)?$'
+            m = _NAME_RE.match(base)
             if m:
                 table_name = m.group('table')
             else:
-                # Фоллбэк на всякий случай: отрезаем "_part…" и опциональное "_shard<id>"
+                # Фоллбэк: отрезаем "_part…" и опциональное "_shard<id>"
                 stem = base
                 if "_part" in stem:
                     stem = stem[:stem.rfind("_part")]
@@ -446,7 +515,7 @@ class CassandraBackup:
                 logger.info(f"Таблица '{table_name}' пустая, пропускаем")
                 return
 
-            # 3) Проверяем, что таблица действительно есть в схеме
+            # 3) Проверяем наличие таблицы в схеме
             ks_meta = self.cluster.metadata.keyspaces.get(keyspace)
             if not ks_meta or table_name not in ks_meta.tables:
                 logger.error(
@@ -470,13 +539,9 @@ class CassandraBackup:
                 bsize = batch_size
                 logger.info(f"Используем заданный batch-size={bsize} для таблицы {table_name}")
 
-            # 5) Готовим prepared statement и коэрсинг типов по метаданным
+            # 5) Prepared + коэрсинг типов
             columns = list(data[0].keys())
-
-            # Экранируем имена колонок (на случай reserved words/регистра/символов)
-            col_str = ", ".join([f'"{c}"' for c in columns])
-
-            # В Cassandra для prepared-запросов используются только '?'
+            col_str = ", ".join([f'"{c}"' for c in columns])  # экранируем имена
             placeholders = ", ".join(["?"] * len(columns))
 
             table_meta = ks_meta.tables[table_name]
@@ -552,7 +617,7 @@ class CassandraBackup:
             stmt_str = raw_stmt.strip()
             if not stmt_str:
                 continue
-            # пропуски предупреждений/комментариев
+            # пропускаем предупреждения/комментарии
             if stmt_str.upper().startswith("WARNING") or stmt_str.startswith("--"):
                 continue
             try:
@@ -607,7 +672,6 @@ class CassandraBackup:
 
         logger.info(f"✅ Восстановление keyspace '{keyspace}' завершено")
 
-
 # -------------------- TLS --------------------
 
 def build_ssl_context(enable_ssl: bool, ca_cert: Optional[str], client_cert: Optional[str],
@@ -628,7 +692,6 @@ def build_ssl_context(enable_ssl: bool, ca_cert: Optional[str], client_cert: Opt
         ctx.load_cert_chain(certfile=client_cert, keyfile=client_key)
 
     return ctx
-
 
 # -------------------- CLI --------------------
 
@@ -720,30 +783,28 @@ async def main():
     )
     await backup.connect()
 
-    try:
-        if args.command == "backup":
-            tables = [t.strip() for t in args.tables.split(",")] if args.tables else None
-            await backup.backup_keyspace(args.keyspace, args.output_dir,
-                                         tables=tables,
-                                         fetch_size=args.fetch_size,
-                                         gzip_enabled=args.gzip,
-                                         chunk_size=args.chunk_size,
-                                         parallel=args.parallel,
-                                         shards=args.shards,
-                                         limit_per_table=args.limit,
-                                         estimate_progress=args.estimate_progress)
-        elif args.command == "restore":
-            tables = [t.strip() for t in args.tables.split(",")] if args.tables else None
-            await backup.restore_keyspace(args.keyspace, args.input_dir,
-                                          drop=args.drop,
-                                          batch_size=args.batch_size,
-                                          parallel=args.parallel,
-                                          tables=tables,
-                                          retries=args.retries,
-                                          retry_delay=args.retry_delay)
-    finally:
-        await backup.close()
+    if args.command == "backup":
+        tables = [t.strip() for t in args.tables.split(",")] if args.tables else None
+        await backup.backup_keyspace(args.keyspace, args.output_dir,
+                                     tables=tables,
+                                     fetch_size=args.fetch_size,
+                                     gzip_enabled=args.gzip,
+                                     chunk_size=args.chunk_size,
+                                     parallel=args.parallel,
+                                     shards=args.shards,
+                                     limit_per_table=args.limit,
+                                     estimate_progress=args.estimate_progress)
+    elif args.command == "restore":
+        tables = [t.strip() for t in args.tables.split(",")] if args.tables else None
+        await backup.restore_keyspace(args.keyspace, args.input_dir,
+                                      drop=args.drop,
+                                      batch_size=args.batch_size,
+                                      parallel=args.parallel,
+                                      tables=tables,
+                                      retries=args.retries,
+                                      retry_delay=args.retry_delay)
 
+    await backup.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
