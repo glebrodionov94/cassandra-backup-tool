@@ -528,7 +528,7 @@ class CassandraBackup:
                 self._wait_schema_agreement()
 
         # Восстанавливаем схему
-        schema_file = os.path.join(input_dir, f"{keyspace}_schema.cql}")
+        schema_file = os.path.join(input_dir, f"{keyspace}_schema.cql")
         # ↑ исправим опечатку пути, если вдруг случится — используем корректный файл
         schema_file = os.path.join(input_dir, f"{keyspace}_schema.cql")
         with open(schema_file, "r", encoding="utf-8") as f:
