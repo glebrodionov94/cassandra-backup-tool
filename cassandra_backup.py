@@ -183,13 +183,37 @@ class CassandraBackup:
         return [col.name for col in table_meta.partition_key]
 
     def _wait_schema_agreement(self, timeout=240, poll=2) -> bool:
-        """Синхронное ожидание согласования схемы — быстрое; можно оставить sync."""
+        """
+        Кросс-версионное ожидание schema agreement.
+        1) Если есть session.wait_for_schema_agreement(timeout) — используем его.
+        2) Иначе проверяем вручную через system.local/system.peers.
+        """
         import time
-        start = time.time()
-        while time.time() - start < timeout:
-            if self.cluster.metadata.check_schema_agreement():
-                return True
+
+        # В некоторых версиях драйвера это есть прямо у session
+        wait_fn = getattr(self.session, "wait_for_schema_agreement", None)
+        if callable(wait_fn):
+            try:
+                return bool(wait_fn(timeout=timeout))
+            except Exception as e:
+                logger.debug(f"wait_for_schema_agreement failed, fall back to manual check: {e}")
+
+        # Фоллбэк: ручная проверка
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                # schema_version одинаков на всех нодах => согласование достигнуто
+                local = self.session.execute("SELECT schema_version FROM system.local")
+                peers = self.session.execute("SELECT schema_version FROM system.peers")
+                versions = {row.schema_version for row in local} | {row.schema_version for row in peers}
+                versions.discard(None)
+                if len(versions) <= 1:
+                    return True
+            except Exception as e:
+                logger.debug(f"manual schema agreement check failed: {e}")
+
             time.sleep(poll)
+
         logger.warning("Schema agreement not reached within timeout")
         return False
 
