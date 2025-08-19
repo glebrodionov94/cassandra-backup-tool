@@ -19,6 +19,7 @@ from cassandra.auth import PlainTextAuthProvider
 from cassandra.query import SimpleStatement, BatchStatement
 from cassandra.metadata import ColumnMetadata
 from cassandra.policies import DCAwareRoundRobinPolicy
+from cassandra.query import dict_factory
 from tqdm import tqdm
 
 logger = logging.getLogger("cassandra_backup")
@@ -42,6 +43,12 @@ CONSISTENCY_MAP = {
 # pattern для имён файлов частей
 _NAME_RE = re.compile(
     r'^(?P<table>.+?)(?:_shard(?P<shard>\d+))?_part(?P<part>\d+)\.json(?:\.gz)?$'
+)
+
+# создаём профиль
+profile = ExecutionProfile(
+    load_balancing_policy=DCAwareRoundRobinPolicy(local_dc="DC1"),
+    row_factory=dict_factory
 )
 
 # -------------------- JSON (де)сериализация специальных типов --------------------
@@ -121,7 +128,8 @@ class CassandraBackup:
             auth_provider=auth_provider,
             ssl_context=ssl_context,
             load_balancing_policy=DCAwareRoundRobinPolicy(local_dc=local_dc),
-            protocol_version=protocol_version
+            protocol_version=protocol_version,
+            execution_profiles={EXEC_PROFILE_DEFAULT: profile}
         )
         self.session = None
         self.idempotent = bool(idempotent)
