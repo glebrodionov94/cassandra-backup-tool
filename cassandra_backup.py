@@ -294,11 +294,11 @@ class CassandraBackup:
                                      -2**63, 2**63 - 1, sem, pbar, table_limit)
 
     async def backup_keyspace(self, keyspace: str, output_dir: str,
-                              tables=None, fetch_size: int = 5000,
-                              gzip_enabled: bool = False, chunk_size: Optional[int] = None,
-                              parallel: int = 2, shards: Optional[int] = None,
-                              limit_per_table: Optional[int] = None,
-                              estimate_progress: bool = False):
+                            tables=None, fetch_size: int = 5000,
+                            gzip_enabled: bool = False, chunk_size: Optional[int] = None,
+                            parallel: int = 2, shards: Optional[int] = None,
+                            limit_per_table: Optional[int] = None,
+                            estimate_progress: bool = False):
         """Бэкап keyspace (таблицы выборочно/все), шардирование и лимит строк."""
         os.makedirs(output_dir, exist_ok=True)
         keyspace_meta = self.cluster.metadata.keyspaces[keyspace]
@@ -316,7 +316,11 @@ class CassandraBackup:
 
         # Автовыбор шардов: 2 × число узлов, если не задано явно
         if shards is None:
-            num_nodes = len(self.cluster.metadata.all_hosts)
+            meta = self.cluster.metadata
+            # В разных версиях драйвера all_hosts бывает методом или коллекцией
+            hosts_obj = meta.all_hosts() if callable(getattr(meta, "all_hosts", None)) else meta.all_hosts
+            # Приводим к списку на случай set/iterator
+            num_nodes = len(list(hosts_obj))
             shards = max(1, num_nodes * 2)
             logger.info(f"Автоматически выбрано количество шардов: {shards} (узлов: {num_nodes})")
         else:
@@ -336,23 +340,23 @@ class CassandraBackup:
                 f.write(f"{mv.as_cql_query()};\n\n")
         logger.info(f"Схема keyspace '{keyspace}' сохранена в {schema_file}")
 
-        # Прогресс: без COUNT(*) (дорого). По желанию можно включить грубую оценку.
+        # Прогресс: без COUNT(*) (дорого). По желанию — грубая оценка.
         total_rows = None
         if estimate_progress:
-            logger.info("Включена грубая оценка прогресса (total). Внимание: может быть неточно.")
-            # На ваше усмотрение можно прикинуть total по лимитам.
+            logger.info("Включена грубая оценка прогресса (total).")
             if limit_per_table:
                 total_rows = limit_per_table * len(table_names)
 
+        # Параллельная выгрузка таблиц
         self._pbar_lock = asyncio.Lock()
         sem = asyncio.Semaphore(parallel)
         desc = "Общий прогресс бэкапа"
         with tqdm(total=total_rows, desc=desc, unit="строк") as pbar:
             tasks = [
                 self._backup_table(keyspace, tname, output_dir,
-                                   fetch_size, gzip_enabled, chunk_size,
-                                   shards, sem, pbar,
-                                   limit_per_table)
+                                fetch_size, gzip_enabled, chunk_size,
+                                shards, sem, pbar,
+                                limit_per_table)
                 for tname in table_names
             ]
             await asyncio.gather(*tasks)
