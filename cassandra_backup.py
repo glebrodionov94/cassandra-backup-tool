@@ -14,12 +14,11 @@ from decimal import Decimal
 from uuid import UUID
 from datetime import datetime
 
-from cassandra.cluster import Cluster, ConsistencyLevel, ResultSet
+from cassandra.cluster import Cluster, ConsistencyLevel, ResultSet, SocketOptions
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.query import SimpleStatement, BatchStatement
 from cassandra.metadata import ColumnMetadata
-from cassandra.policies import DCAwareRoundRobinPolicy
-from cassandra.query import dict_factory
+from cassandra.policies import DCAwareRoundRobinPolicy, ExponentialReconnectionPolicy
 from tqdm import tqdm
 
 logger = logging.getLogger("cassandra_backup")
@@ -61,6 +60,7 @@ def _json_default(o: Any):
         return {"__blob__": True, "b64": base64.b64encode(bytes(o)).decode("ascii")}
     return o  # пусть попробует сериализовать как есть
 
+
 def _coerce_value(col_meta: ColumnMetadata, v: Any):
     """
     Минимальный коэрсер типов JSON->Cassandra на основе метаданных колонки.
@@ -90,6 +90,7 @@ def _coerce_value(col_meta: ColumnMetadata, v: Any):
         logger.warning(f"Не удалось привести значение для колонки {col_meta.name} типа {name}: {e}")
     return v
 
+
 def _make_idempotent(stmt_str: str) -> str:
     """
     Добавляет IF NOT EXISTS для CREATE объектов, где это безопасно и уместно.
@@ -105,6 +106,7 @@ def _make_idempotent(stmt_str: str) -> str:
     # KEYSPACE обычно уже содержит IF NOT EXISTS в экспортерах драйвера
     return s
 
+
 # -------------------- Класс бэкапа/восстановления --------------------
 
 class CassandraBackup:
@@ -117,13 +119,16 @@ class CassandraBackup:
         if username and password:
             auth_provider = PlainTextAuthProvider(username=username, password=password)
 
+        # Больше устойчивости к сетевым обрывам: TCP keepalive + экспоненциальный реконнект
         self.cluster = Cluster(
             contact_points=contact_points,
             port=port,
             auth_provider=auth_provider,
             ssl_context=ssl_context,
             load_balancing_policy=DCAwareRoundRobinPolicy(local_dc=local_dc),
-            protocol_version=protocol_version
+            reconnection_policy=ExponentialReconnectionPolicy(1.0, 30.0),
+            socket_options=SocketOptions(connect_timeout=10.0, keepalive=True),
+            protocol_version=protocol_version,
         )
         self.session = None
         self.idempotent = bool(idempotent)
@@ -157,14 +162,16 @@ class CassandraBackup:
     async def _await_rf(self, response_future):
         """
         Надёжно ждём завершение ResponseFuture без колбэков на event loop.
-        Дополнительно: безопасно обрабатываем None от драйвера.
+        Безопасно обрабатываем None от драйвера.
         """
         if response_future is None:
             return None
+
         def _wait():
             if self.timeout is not None:
                 return response_future.result(timeout=self.timeout)
             return response_future.result()
+
         return await asyncio.to_thread(_wait)
 
     def _exec_async(self, statement, write: bool = False):
@@ -176,7 +183,8 @@ class CassandraBackup:
     async def _iter_rows(self, stmt: SimpleStatement) -> Iterable:
         """
         Асинхронный итератор по всем строкам с поддержкой пагинации.
-        В разных версиях драйвера первая страница может прийти list или ResultSet.
+        В некоторых версиях драйвера первая страница может прийти list или ResultSet,
+        а fetch_next_page() иногда возвращает None — учитываем оба случая.
         """
         rf = self._exec_async(stmt, write=False)
         result = await self._await_rf(rf)
@@ -191,11 +199,9 @@ class CassandraBackup:
             yield row
 
         while state is not None and getattr(state, "has_more_pages", False):
-            # В некоторых версиях драйвера fetch_next_page() возвращает None
             next_rf = getattr(state, "fetch_next_page", lambda: None)()
             next_res = await self._await_rf(next_rf)
             if next_res is None:
-                # Нечего больше читать или драйвер не дал future — выходим из пагинации
                 break
             rows, state = _page_rows_and_state(next_res)
             for row in rows:
@@ -538,8 +544,6 @@ class CassandraBackup:
 
         # Восстанавливаем схему
         schema_file = os.path.join(input_dir, f"{keyspace}_schema.cql")
-        # ↑ исправим опечатку пути, если вдруг случится — используем корректный файл
-        schema_file = os.path.join(input_dir, f"{keyspace}_schema.cql")
         with open(schema_file, "r", encoding="utf-8") as f:
             schema_cql = f.read()
 
@@ -603,6 +607,7 @@ class CassandraBackup:
 
         logger.info(f"✅ Восстановление keyspace '{keyspace}' завершено")
 
+
 # -------------------- TLS --------------------
 
 def build_ssl_context(enable_ssl: bool, ca_cert: Optional[str], client_cert: Optional[str],
@@ -623,6 +628,7 @@ def build_ssl_context(enable_ssl: bool, ca_cert: Optional[str], client_cert: Opt
         ctx.load_cert_chain(certfile=client_cert, keyfile=client_key)
 
     return ctx
+
 
 # -------------------- CLI --------------------
 
@@ -714,28 +720,30 @@ async def main():
     )
     await backup.connect()
 
-    if args.command == "backup":
-        tables = [t.strip() for t in args.tables.split(",")] if args.tables else None
-        await backup.backup_keyspace(args.keyspace, args.output_dir,
-                                     tables=tables,
-                                     fetch_size=args.fetch_size,
-                                     gzip_enabled=args.gzip,
-                                     chunk_size=args.chunk_size,
-                                     parallel=args.parallel,
-                                     shards=args.shards,
-                                     limit_per_table=args.limit,
-                                     estimate_progress=args.estimate_progress)
-    elif args.command == "restore":
-        tables = [t.strip() for t in args.tables.split(",")] if args.tables else None
-        await backup.restore_keyspace(args.keyspace, args.input_dir,
-                                      drop=args.drop,
-                                      batch_size=args.batch_size,
-                                      parallel=args.parallel,
-                                      tables=tables,
-                                      retries=args.retries,
-                                      retry_delay=args.retry_delay)
+    try:
+        if args.command == "backup":
+            tables = [t.strip() for t in args.tables.split(",")] if args.tables else None
+            await backup.backup_keyspace(args.keyspace, args.output_dir,
+                                         tables=tables,
+                                         fetch_size=args.fetch_size,
+                                         gzip_enabled=args.gzip,
+                                         chunk_size=args.chunk_size,
+                                         parallel=args.parallel,
+                                         shards=args.shards,
+                                         limit_per_table=args.limit,
+                                         estimate_progress=args.estimate_progress)
+        elif args.command == "restore":
+            tables = [t.strip() for t in args.tables.split(",")] if args.tables else None
+            await backup.restore_keyspace(args.keyspace, args.input_dir,
+                                          drop=args.drop,
+                                          batch_size=args.batch_size,
+                                          parallel=args.parallel,
+                                          tables=tables,
+                                          retries=args.retries,
+                                          retry_delay=args.retry_delay)
+    finally:
+        await backup.close()
 
-    await backup.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
