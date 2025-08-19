@@ -157,7 +157,10 @@ class CassandraBackup:
     async def _await_rf(self, response_future):
         """
         Надёжно ждём завершение ResponseFuture без колбэков на event loop.
+        Дополнительно: безопасно обрабатываем None от драйвера.
         """
+        if response_future is None:
+            return None
         def _wait():
             if self.timeout is not None:
                 return response_future.result(timeout=self.timeout)
@@ -188,8 +191,12 @@ class CassandraBackup:
             yield row
 
         while state is not None and getattr(state, "has_more_pages", False):
-            next_rf = state.fetch_next_page()
+            # В некоторых версиях драйвера fetch_next_page() возвращает None
+            next_rf = getattr(state, "fetch_next_page", lambda: None)()
             next_res = await self._await_rf(next_rf)
+            if next_res is None:
+                # Нечего больше читать или драйвер не дал future — выходим из пагинации
+                break
             rows, state = _page_rows_and_state(next_res)
             for row in rows:
                 yield row
