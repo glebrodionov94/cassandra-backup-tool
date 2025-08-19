@@ -128,19 +128,17 @@ class CassandraBackup:
 
     async def _await_rf(self, response_future):
         """
-        Делаем ResponseFuture драйвера awaitable для asyncio.
+        Надёжно ждём завершение ResponseFuture без колбэков на event loop.
+        Работает во всех версиях драйвера.
         """
-        loop = asyncio.get_running_loop()
-        afut = loop.create_future()
+        # .result(timeout=...) блокирует текущий поток; переносим в thread, чтобы не блокировать asyncio loop
+        def _wait():
+            # у некоторых версий .result() принимает timeout
+            if self.timeout is not None:
+                return response_future.result(timeout=self.timeout)
+            return response_future.result()
 
-        def _on_success(result):
-            loop.call_soon_threadsafe(afut.set_result, result)
-
-        def _on_error(exc):
-            loop.call_soon_threadsafe(afut.set_exception, exc)
-
-        response_future.add_callbacks(_on_success, _on_error)
-        return await afut
+        return await asyncio.to_thread(_wait)
 
     def _exec_async(self, statement, write: bool = False):
         """Устанавливаем consistency и отправляем запрос асинхронно."""
@@ -149,21 +147,32 @@ class CassandraBackup:
             statement.is_idempotent = self.idempotent
         return self.session.execute_async(statement, timeout=self.timeout)
 
-    async def _iter_rows(self, stmt: SimpleStatement) -> Iterable:
+    async def _iter_rows(self, stmt: SimpleStatement):
         """
-        Асинхронный итератор по всем страницам ResultSet (respect fetch_size).
+        Асинхронный итератор по строкам с поддержкой пагинации.
+        В разных версиях драйвера начальный результат может быть list или ResultSet.
         """
         rf = self._exec_async(stmt, write=False)
-        rs: ResultSet = await self._await_rf(rf)
-        # первая страница
-        for row in rs.current_rows:
+        result = await self._await_rf(rf)
+
+        # helper: отдать текущую "страницу" строк и флаг, есть ли пагинация
+        def _page_rows_and_state(res):
+            # ResultSet с current_rows/has_more_pages
+            if hasattr(res, "current_rows"):
+                return res.current_rows, res
+            # Некоторые версии возвращают сразу list[Row]
+            return res, None
+
+        rows, state = _page_rows_and_state(result)
+        for row in rows:
             yield row
 
-        # последующие страницы
-        while rs.has_more_pages:
-            rf2 = rs.fetch_next_page()
-            rs = await self._await_rf(rf2)
-            for row in rs.current_rows:
+        # Если есть state (ResultSet), докачиваем остальные страницы
+        while state is not None and getattr(state, "has_more_pages", False):
+            next_rf = state.fetch_next_page()
+            next_res = await self._await_rf(next_rf)
+            rows, state = _page_rows_and_state(next_res)
+            for row in rows:
                 yield row
 
     # ---------- Метаданные ----------
