@@ -453,11 +453,20 @@ class CassandraBackup:
 
             # 5) Готовим prepared statement и коэрсинг типов по метаданным
             columns = list(data[0].keys())
-            col_str = ", ".join(columns)
-            placeholders = ", ".join(["%s"] * len(columns))
+
+            # Экранируем имена колонок (на случай reserved words/регистра/символов)
+            col_str = ", ".join([f'"{c}"' for c in columns])
+
+            # В Cassandra для prepared-запросов используются только '?'
+            placeholders = ", ".join(["?"] * len(columns))
 
             table_meta = ks_meta.tables[table_name]
-            col_metas = [table_meta.columns[c] for c in columns]
+            col_metas = []
+            for c in columns:
+                meta = table_meta.columns.get(c) or table_meta.columns.get(c.lower())
+                if not meta:
+                    raise KeyError(f"Колонка '{c}' не найдена в таблице {table_name}")
+                col_metas.append(meta)
 
             prepared = self.session.prepare(
                 f"INSERT INTO {keyspace}.{table_name} ({col_str}) VALUES ({placeholders})"
