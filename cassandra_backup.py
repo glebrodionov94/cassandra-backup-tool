@@ -18,6 +18,7 @@ from cassandra.cluster import Cluster, ConsistencyLevel, ResultSet
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.query import SimpleStatement, BatchStatement
 from cassandra.metadata import ColumnMetadata
+from cassandra.policies import DCAwareRoundRobinPolicy
 from tqdm import tqdm
 
 logger = logging.getLogger("cassandra_backup")
@@ -117,7 +118,9 @@ class CassandraBackup:
             contact_points=contact_points,
             port=port,
             auth_provider=auth_provider,
-            ssl_context=ssl_context
+            ssl_context=ssl_context,
+            load_balancing_policy=DCAwareRoundRobinPolicy(local_dc="DC1"),
+            protocol_version=5
         )
         self.session = None
         self.idempotent = bool(idempotent)
