@@ -109,7 +109,8 @@ class CassandraBackup:
     def __init__(self, contact_points, username: Optional[str] = None, password: Optional[str] = None,
                  port: int = 9042, ssl_context: Optional[ssl.SSLContext] = None,
                  idempotent: bool = False, timeout: Optional[float] = None,
-                 read_consistency: str = "LOCAL_ONE", write_consistency: str = "QUORUM"):
+                 read_consistency: str = "LOCAL_ONE", write_consistency: str = "QUORUM",
+                 local_dc: str = "DC1", protocol_version: int = 5):
         auth_provider = None
         if username and password:
             auth_provider = PlainTextAuthProvider(username=username, password=password)
@@ -119,8 +120,8 @@ class CassandraBackup:
             port=port,
             auth_provider=auth_provider,
             ssl_context=ssl_context,
-            load_balancing_policy=DCAwareRoundRobinPolicy(local_dc="DC1"),
-            protocol_version=5
+            load_balancing_policy=DCAwareRoundRobinPolicy(local_dc=local_dc),
+            protocol_version=protocol_version
         )
         self.session = None
         self.idempotent = bool(idempotent)
@@ -510,7 +511,6 @@ class CassandraBackup:
 
             logger.info(f"Таблица '{table_name}' восстановлена из {table_file} ({len(data)} строк)")
 
-
     async def restore_keyspace(self, keyspace: str, input_dir: str,
                                drop: bool = False, batch_size: Optional[int] = None,
                                parallel: int = 4, tables=None,
@@ -528,6 +528,8 @@ class CassandraBackup:
                 self._wait_schema_agreement()
 
         # Восстанавливаем схему
+        schema_file = os.path.join(input_dir, f"{keyspace}_schema.cql}")
+        # ↑ исправим опечатку пути, если вдруг случится — используем корректный файл
         schema_file = os.path.join(input_dir, f"{keyspace}_schema.cql")
         with open(schema_file, "r", encoding="utf-8") as f:
             schema_cql = f.read()
@@ -661,6 +663,10 @@ async def main():
     parser.add_argument("--read-consistency", default="LOCAL_ONE", help="Уровень консистентности для SELECT (default=LOCAL_ONE)")
     parser.add_argument("--write-consistency", default="QUORUM", help="Уровень консистентности для INSERT/DDL (default=QUORUM)")
 
+    # новые опции для устранения warning'ов
+    parser.add_argument("--local-dc", default="DC1", help="Имя локального DC для балансировщика (default=DC1)")
+    parser.add_argument("--protocol-version", type=int, default=5, help="Версия протокола Cassandra (default=5)")
+
     # log level
     parser.add_argument("--log-level", default="INFO", help="Уровень логирования (DEBUG, INFO, WARNING, ERROR)")
 
@@ -693,7 +699,9 @@ async def main():
         idempotent=args.idempotent,
         timeout=args.timeout,
         read_consistency=args.read_consistency,
-        write_consistency=args.write_consistency
+        write_consistency=args.write_consistency,
+        local_dc=args.local_dc,
+        protocol_version=args.protocol_version
     )
     await backup.connect()
 
