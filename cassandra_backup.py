@@ -498,86 +498,87 @@ class CassandraBackup:
 
             logger.info(f"Таблица '{table_name}' восстановлена из {table_file} ({len(data)} строк)")
 
-        async def restore_keyspace(self, keyspace: str, input_dir: str,
-                                drop: bool = False, batch_size: Optional[int] = None,
-                                parallel: int = 4, tables=None,
-                                retries: int = 5, retry_delay: int = 2):
-            # DROP (опционально) — DDL + schema agreement
-            if drop:
-                logger.warning(f"Удаляю keyspace '{keyspace}' перед восстановлением")
-                stmt = SimpleStatement(f"DROP KEYSPACE IF EXISTS {keyspace}")
+
+    async def restore_keyspace(self, keyspace: str, input_dir: str,
+                               drop: bool = False, batch_size: Optional[int] = None,
+                               parallel: int = 4, tables=None,
+                               retries: int = 5, retry_delay: int = 2):
+        # DROP (опционально) — DDL + schema agreement
+        if drop:
+            logger.warning(f"Удаляю keyspace '{keyspace}' перед восстановлением")
+            stmt = SimpleStatement(f"DROP KEYSPACE IF EXISTS {keyspace}")
+            stmt.is_idempotent = self.idempotent
+            stmt.consistency_level = self.write_consistency
+            rf = self._exec_async(stmt, write=True)
+            try:
+                await self._await_rf(rf)
+            finally:
+                self._wait_schema_agreement()
+
+        # Восстанавливаем схему
+        schema_file = os.path.join(input_dir, f"{keyspace}_schema.cql")
+        with open(schema_file, "r", encoding="utf-8") as f:
+            schema_cql = f.read()
+
+        # Простая сегментация по ';'
+        for raw_stmt in schema_cql.split(";"):
+            stmt_str = raw_stmt.strip()
+            if not stmt_str:
+                continue
+            # пропуски предупреждений/комментариев
+            if stmt_str.upper().startswith("WARNING") or stmt_str.startswith("--"):
+                continue
+            try:
+                stmt_str = _make_idempotent(stmt_str)
+                stmt = SimpleStatement(stmt_str)
                 stmt.is_idempotent = self.idempotent
                 stmt.consistency_level = self.write_consistency
                 rf = self._exec_async(stmt, write=True)
-                try:
-                    await self._await_rf(rf)
-                finally:
-                    self._wait_schema_agreement()
+                await self._await_rf(rf)
+                # после каждого DDL — дождаться agreement
+                self._wait_schema_agreement()
+            except Exception as e:
+                logger.error(f"Ошибка при выполнении CQL: {stmt_str[:180]}... | {e}")
 
-            # Восстанавливаем схему
-            schema_file = os.path.join(input_dir, f"{keyspace}_schema.cql")
-            with open(schema_file, "r", encoding="utf-8") as f:
-                schema_cql = f.read()
+        logger.info(f"Схема keyspace '{keyspace}' восстановлена")
 
-            # Простая сегментация по ';'
-            for raw_stmt in schema_cql.split(";"):
-                stmt_str = raw_stmt.strip()
-                if not stmt_str:
-                    continue
-                # пропуски предупреждений/комментариев
-                if stmt_str.upper().startswith("WARNING") or stmt_str.startswith("--"):
-                    continue
-                try:
-                    stmt_str = _make_idempotent(stmt_str)
-                    stmt = SimpleStatement(stmt_str)
-                    stmt.is_idempotent = self.idempotent
-                    stmt.consistency_level = self.write_consistency
-                    rf = self._exec_async(stmt, write=True)
-                    await self._await_rf(rf)
-                    # после каждого DDL — дождаться agreement
-                    self._wait_schema_agreement()
-                except Exception as e:
-                    logger.error(f"Ошибка при выполнении CQL: {stmt_str[:180]}... | {e}")
+        # Собираем файлы данных
+        all_files = [os.path.join(input_dir, f) for f in os.listdir(input_dir)
+                     if f.endswith(".json") or f.endswith(".json.gz")]
 
-            logger.info(f"Схема keyspace '{keyspace}' восстановлена")
+        # Фильтр таблиц (если задан)
+        if tables:
+            selected = set(tables)
+            files = [f for f in all_files if os.path.basename(f).split("_part")[0] in selected]
+            logger.info(f"Восстанавливаем только таблицы: {', '.join(sorted(selected))}")
+        else:
+            files = all_files
 
-            # Собираем файлы данных
-            all_files = [os.path.join(input_dir, f) for f in os.listdir(input_dir)
-                        if f.endswith(".json") or f.endswith(".json.gz")]
+        # Сортировка по table, shard, part (надёжно, с regex)
+        def sort_key(fname: str):
+            base = os.path.basename(fname)
+            m = _NAME_RE.match(base)
+            if not m:
+                return (base, 10**9, 10**9)
+            table = m.group('table')
+            shard = int(m.group('shard') or 0)
+            part = int(m.group('part'))
+            return (table, shard, part)
 
-            # Фильтр таблиц (если задан)
-            if tables:
-                selected = set(tables)
-                files = [f for f in all_files if os.path.basename(f).split("_part")[0] in selected]
-                logger.info(f"Восстанавливаем только таблицы: {', '.join(sorted(selected))}")
-            else:
-                files = all_files
+        files.sort(key=sort_key)
 
-            # Сортировка по table, shard, part (надёжно, с regex)
-            def sort_key(fname: str):
-                base = os.path.basename(fname)
-                m = _NAME_RE.match(base)
-                if not m:
-                    return (base, 10**9, 10**9)
-                table = m.group('table')
-                shard = int(m.group('shard') or 0)
-                part = int(m.group('part'))
-                return (table, shard, part)
+        # Параллельная загрузка
+        self._pbar_lock = asyncio.Lock()
+        sem = asyncio.Semaphore(parallel)
+        with tqdm(total=None, desc="Общий прогресс восстановления", unit="строк") as pbar:
+            tasks = [
+                self._restore_table(keyspace, fpath, batch_size, sem, pbar,
+                                    retries=retries, delay=retry_delay)
+                for fpath in files
+            ]
+            await asyncio.gather(*tasks)
 
-            files.sort(key=sort_key)
-
-            # Параллельная загрузка
-            self._pbar_lock = asyncio.Lock()
-            sem = asyncio.Semaphore(parallel)
-            with tqdm(total=None, desc="Общий прогресс восстановления", unit="строк") as pbar:
-                tasks = [
-                    self._restore_table(keyspace, fpath, batch_size, sem, pbar,
-                                        retries=retries, delay=retry_delay)
-                    for fpath in files
-                ]
-                await asyncio.gather(*tasks)
-
-            logger.info(f"✅ Восстановление keyspace '{keyspace}' завершено")
+        logger.info(f"✅ Восстановление keyspace '{keyspace}' завершено")
 
 # -------------------- TLS --------------------
 
